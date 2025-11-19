@@ -63,7 +63,7 @@
 
 安装 Tampermonkey 后，点击下方链接安装脚本：
 
-- [📥 安装脚本](https://greasyfork.org/scripts/xxxxx)（待发布）
+- [📥 从 Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/556279-enaea%E8%87%AA%E5%8A%A8%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B)
 - 或者手动安装：复制 `enaea-auto-study.js` 的内容，在 Tampermonkey 中创建新脚本并粘贴
 
 ---

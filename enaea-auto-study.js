@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ENAEA自动刷课助手
 // @namespace    https://greasyfork.org/
-// @version      1.0
-// @description  中国教育干部网络学院(enaea.edu.cn)自动刷课工具 - 自动连续刷课、多页检测、倍速播放、自动静音、智能跳转
+// @version      1.1
+// @description  中国教育干部网络学院(enaea.edu.cn)自动刷课工具 - 自动连续刷课、多页检测、倍速播放、自动静音、智能跳转、后台播放、防休眠保活
 // @author       Liontooth
 // @match        https://study.enaea.edu.cn/*
 // @match        https://*.ttcdw.cn/*
@@ -35,29 +35,55 @@
     // ==================== 核心功能：劫持播放速度 ====================
     
     function hijackPlaybackRate() {
+        // 劫持 playbackRate：拦截所有对播放速度的设置，强制使用目标倍速
         const originalDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
         Object.defineProperty(HTMLMediaElement.prototype, 'playbackRate', {
             get: function() {
                 return originalDescriptor.get.call(this);
             },
             set: function(value) {
+                if (value !== TARGET_SPEED) {
+                    console.log(`🎯 拦截倍速设置(${value}x)，强制改为${TARGET_SPEED}倍速`);
+                }
                 originalDescriptor.set.call(this, TARGET_SPEED);
-                console.log(`🎯 拦截并强制设置播放速度为${TARGET_SPEED}倍速`);
             },
             configurable: true
         });
+
+        // 劫持 defaultPlaybackRate：
+        // 浏览器在切换视频源（更换src触发load）时会把 playbackRate 在
+        // 内部直接重置为 defaultPlaybackRate（默认1x），这次重置不经过
+        // 上面的属性setter，无法拦截。因此必须同时劫持 defaultPlaybackRate，
+        // 否则自动连播切换视频后倍速会被浏览器悄悄重置回1倍速。
+        const originalDefaultDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'defaultPlaybackRate');
+        if (originalDefaultDescriptor) {
+            Object.defineProperty(HTMLMediaElement.prototype, 'defaultPlaybackRate', {
+                get: function() {
+                    return originalDefaultDescriptor.get.call(this);
+                },
+                set: function(value) {
+                    if (value !== TARGET_SPEED) {
+                        console.log(`🎯 拦截默认倍速设置(${value}x)，强制改为${TARGET_SPEED}倍速`);
+                    }
+                    originalDefaultDescriptor.set.call(this, TARGET_SPEED);
+                },
+                configurable: true
+            });
+        }
     }
 
-    function setVideoSpeed(video) {
-        if (!video || processedVideos.has(video)) return false;
+    // 强制应用倍速与静音设置（可重复调用）
+    // 用于：新视频出现、自动连播切换视频后、倍速被重置时重新应用
+    function enforceVideoSpeed(video) {
+        if (!video) return false;
         try {
+            // 先设置 defaultPlaybackRate：浏览器在切换视频源(load)时会把
+            // playbackRate 内部重置为 defaultPlaybackRate，不设置它就会被重置回1x
+            video.defaultPlaybackRate = TARGET_SPEED;
             video.playbackRate = TARGET_SPEED;
-            processedVideos.add(video);
-            console.log(`✅ 视频播放速度已设置为${TARGET_SPEED}倍速`);
             if (AUTO_MUTE) {
                 video.muted = true;
                 video.volume = 0;
-                console.log('🔇 视频已静音');
             }
             return true;
         } catch (e) {
@@ -66,17 +92,232 @@
         }
     }
 
+    // 仅对"新出现"的视频元素执行一次（记录日志），重复调用会被跳过
+    function setVideoSpeed(video) {
+        if (!video || processedVideos.has(video)) return false;
+        processedVideos.add(video);
+        if (enforceVideoSpeed(video)) {
+            console.log(`✅ 视频播放速度已设置为${TARGET_SPEED}倍速`);
+            if (AUTO_MUTE) {
+                console.log('🔇 视频已静音');
+            }
+            return true;
+        }
+        return false;
+    }
+
     function setAllVideos() {
         const videos = document.querySelectorAll('video');
         let count = 0;
         videos.forEach(video => {
-            if (setVideoSpeed(video)) {
+            if (processedVideos.has(video)) {
+                // 已处理过的视频也要重新强制应用设置：
+                // 自动连播切换视频源后，浏览器会把倍速内部重置回1x
+                enforceVideoSpeed(video);
+            } else if (setVideoSpeed(video)) {
                 count++;
             }
         });
         if (count > 0) {
             console.log(`🎬 找到并设置了 ${count} 个视频`);
         }
+    }
+
+    // ==================== 核心功能：伪装页面可见性（后台播放支持） ====================
+    // 现象：标签页切到后台后视频被暂停。
+    // 原因：浏览器本身不会因标签页切后台而暂停视频，是页面播放器脚本
+    // 监听了 visibilitychange / window blur 或轮询 document.hidden，
+    // 检测到页面不可见时主动暂停视频。
+    // 方案：把页面伪装成"始终可见"，让页面脚本无法感知标签页切换，
+    // 视频在后台标签页也能继续倍速播放。
+
+    // 保存真实的 hidden 读取器（伪装后内部逻辑仍可获知真实可见性）
+    const realHiddenDescriptor =
+        Object.getOwnPropertyDescriptor(Document.prototype, 'hidden') ||
+        Object.getOwnPropertyDescriptor(document, 'hidden');
+
+    function getRealHidden() {
+        try {
+            return realHiddenDescriptor && realHiddenDescriptor.get
+                ? realHiddenDescriptor.get.call(document)
+                : false;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // 内部真实可见性变化回调（默认空实现，由防休眠恢复逻辑赋值）。
+    // 必须注册在下方拦截器"之前"，保证脚本自身仍能感知真实的标签页切换。
+    let onRealVisibilityChange = function() {};
+
+    function spoofPageVisibility() {
+        try {
+            // 伪装 document.hidden / visibilityState 为"始终可见"
+            Object.defineProperty(document, 'hidden', {
+                get: () => false,
+                configurable: true
+            });
+            Object.defineProperty(document, 'visibilityState', {
+                get: () => 'visible',
+                configurable: true
+            });
+            // 兼容旧浏览器的 webkit 前缀属性
+            try {
+                Object.defineProperty(document, 'webkitHidden', { get: () => false, configurable: true });
+                Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+            } catch (e) {}
+            // 部分播放器通过焦点判断用户是否离开
+            try {
+                Object.defineProperty(Document.prototype, 'hasFocus', {
+                    value: function() { return true; },
+                    configurable: true
+                });
+            } catch (e) {}
+            console.log('🎭 页面可见性伪装已启用（后台标签页将被视为可见）');
+        } catch (e) {
+            console.error('❌ 页面可见性伪装失败:', e);
+        }
+
+        // 先注册"内部"可见性钩子（window捕获阶段最先执行）：
+        // 让脚本自身仍能感知真实的标签页切换（用于防休眠恢复等内部逻辑）。
+        // 它先于下面的拦截器注册，因此会先执行，不受 stopImmediatePropagation 影响。
+        window.addEventListener('visibilitychange', function() {
+            try { onRealVisibilityChange(); } catch (e) {}
+        }, true);
+
+        // 拦截 visibilitychange 事件，阻止页面脚本感知标签页切换。
+        // 本脚本以 document-start 运行，此监听器先于页面脚本注册，
+        // 因此 stopImmediatePropagation 能拦截页面后续注册的所有监听器。
+        const swallowVisibilityChange = function(e) {
+            e.stopImmediatePropagation();
+        };
+        window.addEventListener('visibilitychange', swallowVisibilityChange, true);
+        document.addEventListener('visibilitychange', swallowVisibilityChange, true);
+
+        // 拦截 window 自身的失焦事件（切标签页会触发 window blur），
+        // 不影响输入框等元素自身的 blur 事件
+        window.addEventListener('blur', function(e) {
+            if (e.target === window) {
+                e.stopImmediatePropagation();
+            }
+        }, true);
+    }
+
+    // 兜底：若视频在后台标签页中仍被暂停（可见性伪装未能拦截的其他路径），
+    // 自动恢复播放。仅当标签页真实处于后台时才恢复，前台手动暂停不受影响。
+    function setupAutoResume() {
+        document.addEventListener('pause', function(e) {
+            const video = e.target;
+            if (!video || video.tagName !== 'VIDEO') return;
+            if (video.ended) return; // 播放结束属正常暂停，不恢复
+
+            setTimeout(function() {
+                if (getRealHidden() && video.paused && !video.ended) {
+                    video.play().then(function() {
+                        console.log('▶️ 检测到后台标签页中视频被暂停，已自动恢复播放');
+                    }).catch(function(err) {
+                        console.log('⚠️ 自动恢复播放失败:', err && err.message);
+                    });
+                }
+            }, 800);
+        }, true);
+    }
+
+    // ==================== 核心功能：保活音频 + 冻结恢复（防止标签页被休眠） ====================
+    // Chrome 的"内存节省程序"会冻结长时间处于后台的标签页：JS 全部停止、
+    // 视频被暂停、定时器不再运行。豁免规则：正在播放音频（非静音）的标签页
+    // 不会被冻结，其定时器也不会被限流。
+    // 但静音的视频不算"正在播放音频"，因此静音刷课时标签页仍会被冻结。
+    // 方案：用 Web Audio 播放一个 30Hz、音量约-46dB 的正弦波（实际听不到），
+    // 让 Chrome 将标签页判定为"正在播放音频"，从而豁免冻结/休眠。
+    //
+    // 注意：Chrome 自动播放策略要求该页面有过一次用户交互（点击/按键）后
+    // 音频才能真正发声。脚本自动打开的课程页/自动刷新的列表页在用户交互
+    // 前无法激活保活音频——这种情况需要配合浏览器"内存节省程序"的
+    // 网站白名单（设置 → 性能 → 始终保持这些网站处于活动状态）。
+    let keepAliveAudioCtx = null;
+
+    function setupKeepAliveAudio() {
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) {
+                console.log('⚠️ 当前浏览器不支持 Web Audio，无法启用保活音频');
+                return;
+            }
+
+            keepAliveAudioCtx = new AudioCtx();
+
+            const oscillator = keepAliveAudioCtx.createOscillator();
+            const gainNode = keepAliveAudioCtx.createGain();
+            oscillator.type = 'sine';
+            oscillator.frequency.value = 30;  // 低频，人耳基本无法察觉
+            gainNode.gain.value = 0.005;      // 约-46dB：实际听不到，但足以让标签页被判定为"正在播放音频"
+            oscillator.connect(gainNode);
+            gainNode.connect(keepAliveAudioCtx.destination);
+            oscillator.start(0);
+
+            let logged = false;
+            const tryResume = function() {
+                if (keepAliveAudioCtx && keepAliveAudioCtx.state === 'suspended') {
+                    keepAliveAudioCtx.resume().then(function() {
+                        if (keepAliveAudioCtx.state === 'running' && !logged) {
+                            logged = true;
+                            console.log('🔊 保活音频已激活：标签页将被视为"正在播放音频"，不会被浏览器冻结/休眠');
+                        }
+                    }).catch(function() {});
+                }
+            };
+
+            tryResume(); // 立即尝试（本页面此前已有过用户交互时可成功）
+            // 捕获任意用户交互以解锁音频（自动打开/自动刷新的页面需要）
+            ['click', 'keydown', 'pointerdown', 'touchstart'].forEach(function(evt) {
+                window.addEventListener(evt, tryResume, true);
+            });
+            setInterval(tryResume, 30000); // 周期性重试
+        } catch (e) {
+            console.log('⚠️ 保活音频初始化失败:', e);
+        }
+    }
+
+    // 续播所有"被暂停且未结束"的视频（含iframe内）
+    function resumePausedVideos() {
+        const resumeOne = function(video) {
+            if (video.paused && !video.ended) {
+                video.play().then(function() {
+                    console.log('▶️ 已自动续播被暂停的视频');
+                }).catch(function() {});
+            }
+        };
+        document.querySelectorAll('video').forEach(resumeOne);
+        document.querySelectorAll('iframe').forEach(function(iframe) {
+            try {
+                const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                if (iframeDoc) iframeDoc.querySelectorAll('video').forEach(resumeOne);
+            } catch (e) {
+                // 跨域iframe忽略
+            }
+        });
+    }
+
+    // 标签页恢复（从冻结中恢复/重新可见）时：重新应用倍速并续播
+    function recoverPlayback() {
+        setAllVideos();
+        resumePausedVideos();
+    }
+
+    function setupFreezeRecovery() {
+        // Page Lifecycle API：页面从冻结中恢复时
+        document.addEventListener('resume', function() {
+            console.log('🔄 页面从冻结状态恢复，重新应用倍速设置并续播视频');
+            setTimeout(recoverPlayback, 500);
+        });
+
+        // 标签页重新变为可见时（可能刚从冻结中恢复）
+        onRealVisibilityChange = function() {
+            if (!getRealHidden()) {
+                setTimeout(recoverPlayback, 300);
+            }
+        };
     }
 
     // ==================== MutationObserver监控新增视频 ====================
@@ -709,15 +950,27 @@
     // ==================== 监听事件 ====================
     
     function setupEventListeners() {
-        document.addEventListener('play', function(e) {
-            if (e.target.tagName === 'VIDEO') {
-                setVideoSpeed(e.target);
+        // 视频开始播放/恢复播放/加载元数据时，重新强制应用倍速设置。
+        // 注意：必须无条件重新应用（不能用 processedVideos 跳过），
+        // 因为自动连播切换视频后浏览器会把倍速重置回1x。
+        const reapplyOnMediaEvent = function(e) {
+            if (e.target && e.target.tagName === 'VIDEO') {
+                enforceVideoSpeed(e.target);
             }
-        }, true);
+        };
+        document.addEventListener('play', reapplyOnMediaEvent, true);
+        document.addEventListener('playing', reapplyOnMediaEvent, true);
+        document.addEventListener('loadedmetadata', reapplyOnMediaEvent, true);
 
-        document.addEventListener('loadedmetadata', function(e) {
-            if (e.target.tagName === 'VIDEO') {
-                setVideoSpeed(e.target);
+        // 兜底：任何原因导致倍速偏离目标值（包括浏览器在load()内部的重置）
+        // 都立即纠正回目标倍速
+        document.addEventListener('ratechange', function(e) {
+            if (e.target && e.target.tagName === 'VIDEO') {
+                const current = e.target.playbackRate;
+                if (Math.abs(current - TARGET_SPEED) > 0.01) {
+                    console.log(`⚡ 检测到倍速被重置为${current}x，强制恢复为${TARGET_SPEED}倍速`);
+                    enforceVideoSpeed(e.target);
+                }
             }
         }, true);
     }
@@ -731,7 +984,8 @@
                 const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
                 if (iframeDoc) {
                     const videos = iframeDoc.querySelectorAll('video');
-                    videos.forEach(video => setVideoSpeed(video));
+                    // 无条件重应用：iframe 内切换视频源后倍速同样会被重置回1x
+                    videos.forEach(video => enforceVideoSpeed(video));
                 }
             } catch (e) {
                 // 静默处理跨域错误
@@ -757,12 +1011,15 @@
             // ========== 播放页面板 ==========
             panelContent = `
             <div class="panel-header" id="panel-header">
-                <span style="font-weight: bold; font-size: 13px;">🎓 ENAEA自动刷课助手 v1.0</span>
+                <span style="font-weight: bold; font-size: 13px;">🎓 ENAEA自动刷课助手 v1.1</span>
                 <button id="panel-minimize" style="background: none; border: none; color: white; cursor: pointer; font-size: 18px; padding: 0 5px;">−</button>
             </div>
             <div class="panel-content" id="panel-content">
                 <div class="control-group" style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.7); margin-bottom: 10px;">
                     📺 当前：播放页
+                </div>
+                <div class="control-group" style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.7); margin-bottom: 10px;">
+                    后台防休眠: <span id="keepalive-status">检测中...</span>
                 </div>
                 <div class="control-group">
                     <label>
@@ -836,12 +1093,15 @@
             // ========== 列表页面板 ==========
             panelContent = `
             <div class="panel-header" id="panel-header">
-                <span style="font-weight: bold; font-size: 13px;">🎓 ENAEA自动刷课助手 v1.0</span>
+                <span style="font-weight: bold; font-size: 13px;">🎓 ENAEA自动刷课助手 v1.1</span>
                 <button id="panel-minimize" style="background: none; border: none; color: white; cursor: pointer; font-size: 18px; padding: 0 5px;">−</button>
             </div>
             <div class="panel-content" id="panel-content">
                 <div class="control-group" style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.7); margin-bottom: 10px;">
                     📋 当前：列表页
+                </div>
+                <div class="control-group" style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.7); margin-bottom: 10px;">
+                    后台防休眠: <span id="keepalive-status">检测中...</span>
                 </div>
                 <div class="control-group">
                     <label>
@@ -996,6 +1256,22 @@
         }
         updateCountDisplay();
         setInterval(updateCountDisplay, 5000);
+
+        // 更新防休眠保活状态显示
+        function updateKeepAliveStatus() {
+            const statusSpan = document.getElementById('keepalive-status');
+            if (statusSpan) {
+                if (keepAliveAudioCtx && keepAliveAudioCtx.state === 'running') {
+                    statusSpan.textContent = '✅ 已激活';
+                    statusSpan.style.color = '#4ade80';
+                } else {
+                    statusSpan.textContent = '⏳ 点击页面任意处激活';
+                    statusSpan.style.color = '#fbbf24';
+                }
+            }
+        }
+        updateKeepAliveStatus();
+        setInterval(updateKeepAliveStatus, 2000);
 
         // 拖拽功能
         let isDragging = false;
@@ -1174,8 +1450,8 @@
     
     function init() {
         console.log('═══════════════════════════════════════');
-        console.log('📚 ENAEA自动刷课助手 v1.0');
-        console.log('✨ 自动连续刷课 + 列表页自动选课 + 播放页自动刷课');
+        console.log('📚 ENAEA自动刷课助手 v1.1');
+        console.log('✨ 自动连续刷课 + 列表页自动选课 + 播放页自动刷课 + 后台防休眠');
         console.log('👤 作者: Liontooth');
         console.log('═══════════════════════════════════════');
         
@@ -1201,6 +1477,9 @@
         startObserver();
         setInterval(setAllVideos, 2000);
         setupEventListeners();
+        setupAutoResume();
+        setupKeepAliveAudio();
+        setupFreezeRecovery();
 
         // 判断当前页面类型并执行相应的自动化功能
         const currentUrl = window.location.href;
@@ -1251,6 +1530,11 @@
             }, 1000);
         }
     }
+
+    // 页面可见性伪装必须在页面脚本运行之前完成（抢注事件拦截器+属性伪装）。
+    // 本脚本以 document-start 运行，IIFE 同步执行到这里时页面脚本尚未运行，
+    // 因此在此调用即可保证先于所有页面脚本生效。
+    spoofPageVisibility();
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
